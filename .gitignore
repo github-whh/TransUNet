@@ -1,0 +1,3 @@
+TransUNet/model_DLoss
+TransUNet/model_L2Loss
+model/vit_checkpoint/imagenet21k
