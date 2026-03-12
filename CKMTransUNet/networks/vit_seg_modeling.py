@@ -130,8 +130,8 @@ class Embeddings(nn.Module):
 
         if config.patches.get("grid") is not None:   # ResNet
             grid_size = config.patches["grid"]
-            patch_size = (img_size[0] // 16 // grid_size[0], img_size[1] // 16 // grid_size[1])
-            patch_size_real = (patch_size[0] * 16, patch_size[1] * 16)
+            patch_size = (img_size[0] // config.patch_size // grid_size[0], img_size[1] // config.patch_size // grid_size[1])
+            patch_size_real = (patch_size[0] * config.patch_size, patch_size[1] * config.patch_size)
             n_patches = (img_size[0] // patch_size_real[0]) * (img_size[1] // patch_size_real[1])  
             self.hybrid = True
         else:
@@ -140,7 +140,9 @@ class Embeddings(nn.Module):
             self.hybrid = False
 
         if self.hybrid:
-            self.hybrid_model = ResNetV2(block_units=config.resnet.num_layers, width_factor=config.resnet.width_factor)
+            self.hybrid_model = ResNetV2(block_units=config.resnet.num_layers, 
+                                         width_factor=config.resnet.width_factor,
+                                         patch_size=config.patch_size)
             in_channels = self.hybrid_model.width * 16
         self.patch_embeddings = Conv2d(in_channels=in_channels,
                                        out_channels=config.hidden_size,
@@ -324,46 +326,45 @@ class DecoderBlock(nn.Module):
 
 class DecoderCup(nn.Module):
     def __init__(self, config):
-        super().__init__()
-        self.config = config
-        head_channels = 512
-        self.conv_more = Conv2dReLU(
-            config.hidden_size,
-            head_channels,
-            kernel_size=3,
-            padding=1,
-            use_batchnorm=True,
-        )
-        decoder_channels = config.decoder_channels
-        in_channels = [head_channels] + list(decoder_channels[:-1])
-        out_channels = decoder_channels
+            super().__init__()
+            self.config = config
+            head_channels = 512
+            self.conv_more = Conv2dReLU(config.hidden_size, head_channels, kernel_size=3, padding=1)
+            
+            decoder_channels = config.decoder_channels
+            in_channels = [head_channels] + list(decoder_channels[:-1])
+            out_channels = decoder_channels
 
-        if self.config.n_skip != 0:
-            skip_channels = self.config.skip_channels
-            for i in range(4-self.config.n_skip):  # re-select the skip channels according to n_skip
-                skip_channels[3-i]=0
+            # Core fix: change hardcoded 4 to len(decoder_channels)
+            num_stages = len(decoder_channels)
+            if self.config.n_skip != 0:
+                skip_channels = list(self.config.skip_channels)
+                for i in range(num_stages - self.config.n_skip):
+                    skip_channels[num_stages - 1 - i] = 0
+            else:
+                skip_channels = [0] * num_stages
 
-        else:
-            skip_channels=[0,0,0,0]
-
-        blocks = [
-            DecoderBlock(in_ch, out_ch, sk_ch) for in_ch, out_ch, sk_ch in zip(in_channels, out_channels, skip_channels)
-        ]
-        self.blocks = nn.ModuleList(blocks)
+            blocks = [
+                DecoderBlock(in_ch, out_ch, sk_ch) 
+                for in_ch, out_ch, sk_ch in zip(in_channels, out_channels, skip_channels)
+            ]
+            self.blocks = nn.ModuleList(blocks)
 
     def forward(self, hidden_states, features=None):
-        B, n_patch, hidden = hidden_states.size()  # reshape from (B, n_patch, hidden) to (B, h, w, hidden)
-        h, w = int(np.sqrt(n_patch)), int(np.sqrt(n_patch))
-        x = hidden_states.permute(0, 2, 1)
-        x = x.contiguous().view(B, hidden, h, w)
-        x = self.conv_more(x)
-        for i, decoder_block in enumerate(self.blocks):
-            if features is not None:
-                skip = features[i] if (i < self.config.n_skip) else None
-            else:
-                skip = None
-            x = decoder_block(x, skip=skip)
-        return x
+            B, n_patch, hidden = hidden_states.size()
+            h, w = int(np.sqrt(n_patch)), int(np.sqrt(n_patch))
+            x = hidden_states.permute(0, 2, 1)
+            x = x.contiguous().view(B, hidden, h, w)
+            x = self.conv_more(x)
+            
+            for i, decoder_block in enumerate(self.blocks):
+                if features is not None:
+                    # Core fix: add len(features) check to prevent out-of-bounds
+                    skip = features[i] if (i < self.config.n_skip and i < len(features)) else None
+                else:
+                    skip = None
+                x = decoder_block(x, skip=skip)
+            return x
 
 
 class VisionTransformer(nn.Module):
@@ -390,7 +391,10 @@ class VisionTransformer(nn.Module):
     def forward(self, x):
         x = self.input_adapter(x)
         x, attn_weights, features = self.transformer(x)  # (B, n_patch, hidden)
-        x = self.decoder(x, features)
+        if self.config.patch_size == 8:
+            x = self.decoder(x, features[1:]) 
+        else:
+            x = self.decoder(x, features)
         x = self.regression_head(x)
         return x
 
@@ -451,6 +455,7 @@ CONFIGS = {
     'ViT-H_14': configs.get_h14_config(),
     'R50-ViT-B_16': configs.get_r50_b16_config(),
     'R50-ViT-L_16': configs.get_r50_l16_config(),
+    'R50-ViT-B_8': configs.get_r50_b8_config(),
     'testing': configs.get_testing(),
 }
 
