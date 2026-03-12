@@ -26,13 +26,11 @@ class StdConv2d(nn.Conv2d):
 
 
 def conv3x3(cin, cout, stride=1, groups=1, bias=False):
-    return StdConv2d(cin, cout, kernel_size=3, stride=stride,
-                     padding=1, bias=bias, groups=groups)
+    return StdConv2d(cin, cout, kernel_size=3, stride=stride, padding=1, bias=bias, groups=groups)
 
 
 def conv1x1(cin, cout, stride=1, bias=False):
-    return StdConv2d(cin, cout, kernel_size=1, stride=stride,
-                     padding=0, bias=bias)
+    return StdConv2d(cin, cout, kernel_size=1, stride=stride, padding=0, bias=bias)
 
 
 class PreActBottleneck(nn.Module):
@@ -69,51 +67,9 @@ class PreActBottleneck(nn.Module):
         y = self.relu(self.gn1(self.conv1(x)))
         y = self.relu(self.gn2(self.conv2(y)))
         y = self.gn3(self.conv3(y))
-
         y = self.relu(residual + y)
         return y
 
-# class PreActBottleneck(nn.Module):
-#     """Pre-activation (v2) bottleneck block with CBAM."""
-    
-#     def __init__(self, cin, cout=None, cmid=None, stride=1, use_cbam=True):
-#         super().__init__()
-#         cout = cout or cin
-#         cmid = cmid or cout//4
-        
-#         self.gn1 = nn.GroupNorm(32, cmid, eps=1e-6)
-#         self.conv1 = conv1x1(cin, cmid, bias=False)
-#         self.gn2 = nn.GroupNorm(32, cmid, eps=1e-6)
-#         self.conv2 = conv3x3(cmid, cmid, stride, bias=False)
-#         self.gn3 = nn.GroupNorm(32, cout, eps=1e-6)
-#         self.conv3 = conv1x1(cmid, cout, bias=False)
-#         self.relu = nn.ReLU(inplace=True)
-        
-#         # 添加CBAM
-#         self.use_cbam = use_cbam
-#         if use_cbam:
-#             self.cbam = CBAM(cout)
-        
-#         if (stride != 1 or cin != cout):
-#             self.downsample = conv1x1(cin, cout, stride, bias=False)
-#             self.gn_proj = nn.GroupNorm(cout, cout)
-
-#     def forward(self, x):
-#         residual = x
-#         if hasattr(self, 'downsample'):
-#             residual = self.downsample(x)
-#             residual = self.gn_proj(residual)
-
-#         y = self.relu(self.gn1(self.conv1(x)))
-#         y = self.relu(self.gn2(self.conv2(y)))
-#         y = self.gn3(self.conv3(y))
-        
-#         # 应用CBAM
-#         if self.use_cbam:
-#             y = self.cbam(y)
-        
-#         y = self.relu(residual + y)
-#         return y
 
     def load_from(self, weights, n_block, n_unit):
         conv1_weight = np2th(weights[pjoin(n_block, n_unit, "conv1/kernel").replace("\\","/")], conv=True)
@@ -152,124 +108,77 @@ class PreActBottleneck(nn.Module):
             self.gn_proj.bias.copy_(proj_gn_bias.view(-1))
 
 class ResNetV2(nn.Module):
-    """Implementation of Pre-activation (v2) ResNet mode."""
+    """Improved Pre-activation (v2) ResNet with dynamic downsampling rate"""
 
-    def __init__(self, block_units, width_factor):
+    def __init__(self, block_units, width_factor, patch_size=16):
         super().__init__()
         width = int(64 * width_factor)
         self.width = width
 
+        # Core logic: dynamically determine block3 stride based on patch_size
+        # patch_size=16 -> stride=2 (total downsampling 16x)
+        # patch_size=8  -> stride=1 (total downsampling 8x)
+        self.block3_stride = 2 if patch_size == 16 else 1
+
+        # Root part remains unchanged (downsampling 2x)
         self.root = nn.Sequential(OrderedDict([
             ('conv', StdConv2d(3, width, kernel_size=7, stride=2, bias=False, padding=3)),
             ('gn', nn.GroupNorm(32, width, eps=1e-6)),
             ('relu', nn.ReLU(inplace=True)),
-            # ('pool', nn.MaxPool2d(kernel_size=3, stride=2, padding=0))
         ]))
 
         self.body = nn.Sequential(OrderedDict([
+            # block1: output stride=4 (due to root 2x + pool 2x)
             ('block1', nn.Sequential(OrderedDict(
                 [('unit1', PreActBottleneck(cin=width, cout=width*4, cmid=width))] +
                 [(f'unit{i:d}', PreActBottleneck(cin=width*4, cout=width*4, cmid=width)) for i in range(2, block_units[0] + 1)],
-                ))),
+            ))),
+            # block2: introduce stride=2, output stride=8
             ('block2', nn.Sequential(OrderedDict(
                 [('unit1', PreActBottleneck(cin=width*4, cout=width*8, cmid=width*2, stride=2))] +
                 [(f'unit{i:d}', PreActBottleneck(cin=width*8, cout=width*8, cmid=width*2)) for i in range(2, block_units[1] + 1)],
-                ))),
+            ))),
+            # block3: dynamic stride, output stride=16 (original) or stride=8 (b8 version)
             ('block3', nn.Sequential(OrderedDict(
-                [('unit1', PreActBottleneck(cin=width*8, cout=width*16, cmid=width*4, stride=2))] +
+                [('unit1', PreActBottleneck(cin=width*8, cout=width*16, cmid=width*4, stride=self.block3_stride))] +
                 [(f'unit{i:d}', PreActBottleneck(cin=width*16, cout=width*16, cmid=width*4)) for i in range(2, block_units[2] + 1)],
-                ))),
+            ))),
         ]))
-
-    # def __init__(self, block_units, width_factor, use_cbam=True):
-    #     super().__init__()
-    #     width = int(64 * width_factor)
-    #     self.width = width
-        
-    #     self.root = nn.Sequential(OrderedDict([
-    #         ('conv', StdConv2d(3, width, kernel_size=7, stride=2, bias=False, padding=3)),
-    #         ('gn', nn.GroupNorm(32, width, eps=1e-6)),
-    #         ('relu', nn.ReLU(inplace=True)),
-    #     ]))
-        
-    #     self.body = nn.Sequential(OrderedDict([
-    #         ('block1', nn.Sequential(OrderedDict(
-    #             [('unit1', PreActBottleneck(cin=width, cout=width*4, cmid=width, use_cbam=use_cbam))] +
-    #             [(f'unit{i:d}', PreActBottleneck(cin=width*4, cout=width*4, cmid=width, use_cbam=use_cbam)) 
-    #              for i in range(2, block_units[0] + 1)],
-    #         ))),
-    #         ('block2', nn.Sequential(OrderedDict(
-    #             [('unit1', PreActBottleneck(cin=width*4, cout=width*8, cmid=width*2, stride=2, use_cbam=use_cbam))] +
-    #             [(f'unit{i:d}', PreActBottleneck(cin=width*8, cout=width*8, cmid=width*2, use_cbam=use_cbam)) 
-    #              for i in range(2, block_units[1] + 1)],
-    #         ))),
-    #         ('block3', nn.Sequential(OrderedDict(
-    #             [('unit1', PreActBottleneck(cin=width*8, cout=width*16, cmid=width*4, stride=2, use_cbam=use_cbam))] +
-    #             [(f'unit{i:d}', PreActBottleneck(cin=width*16, cout=width*16, cmid=width*4, use_cbam=use_cbam)) 
-    #              for i in range(2, block_units[2] + 1)],
-    #         ))),
-    #     ]))
 
     def forward(self, x):
         features = []
         b, c, in_size, _ = x.size()
+
+        # 1. Root stage
         x = self.root(x)
-        features.append(x)
-        x = nn.MaxPool2d(kernel_size=3, stride=2, padding=0)(x)
-        for i in range(len(self.body)-1):
+        features.append(x) # [B, 64, 128, 128] (assuming input 256)
+
+        # 2. MaxPool stage
+        x = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)(x)
+
+        # 3. Body stage (iterate through block1 and block2)
+        # Note: Here we manually manage stride counting to calculate right_size
+        current_stride = 4
+        for i in range(len(self.body) - 1): # Only process the first two blocks
             x = self.body[i](x)
-            right_size = int(in_size / 4 / (i+1))
+
+            # The logic here needs care: block1 doesn't downsample (stays 4x), block2 downsamples (becomes 8x)
+            if i == 1:
+                current_stride = 8
+
+            right_size = int(in_size / current_stride)
+
+            # Padding logic maintains original compatibility
             if x.size()[2] != right_size:
                 pad = right_size - x.size()[2]
-                assert pad < 3 and pad > 0, "x {} should {}".format(x.size(), right_size)
                 feat = torch.zeros((b, x.size()[1], right_size, right_size), device=x.device)
                 feat[:, :, 0:x.size()[2], 0:x.size()[3]] = x[:]
             else:
                 feat = x
             features.append(feat)
+
+        # 4. Last block (block3)
         x = self.body[-1](x)
+
+        # Return final features and intermediate features for Skip Connection
         return x, features[::-1]
-    
-
-# class ChannelAttention(nn.Module):
-#     def __init__(self, in_planes, ratio=16):
-#         super(ChannelAttention, self).__init__()
-#         self.avg_pool = nn.AdaptiveAvgPool2d(1)
-#         self.max_pool = nn.AdaptiveMaxPool2d(1)
-        
-#         self.fc1 = nn.Conv2d(in_planes, in_planes // ratio, 1, bias=False)
-#         self.relu1 = nn.ReLU()
-#         self.fc2 = nn.Conv2d(in_planes // ratio, in_planes, 1, bias=False)
-        
-#         self.sigmoid = nn.Sigmoid()
-
-#     def forward(self, x):
-#         avg_out = self.fc2(self.relu1(self.fc1(self.avg_pool(x))))
-#         max_out = self.fc2(self.relu1(self.fc1(self.max_pool(x))))
-#         out = avg_out + max_out
-#         return self.sigmoid(out)
-
-# class SpatialAttention(nn.Module):
-#     def __init__(self, kernel_size=7):
-#         super(SpatialAttention, self).__init__()
-        
-#         self.conv1 = nn.Conv2d(2, 1, kernel_size, padding=kernel_size//2, bias=False)
-#         self.sigmoid = nn.Sigmoid()
-
-#     def forward(self, x):
-#         avg_out = torch.mean(x, dim=1, keepdim=True)
-#         max_out, _ = torch.max(x, dim=1, keepdim=True)
-#         x = torch.cat([avg_out, max_out], dim=1)
-#         x = self.conv1(x)
-#         return self.sigmoid(x)
-
-# class CBAM(nn.Module):
-#     def __init__(self, in_planes, ratio=16, kernel_size=7):
-#         super(CBAM, self).__init__()
-#         self.ca = ChannelAttention(in_planes, ratio)
-#         self.sa = SpatialAttention(kernel_size)
-
-#     def forward(self, x):
-#         x = x * self.ca(x)
-#         x = x * self.sa(x)
-#         return x
